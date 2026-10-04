@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日财经科技要闻（国内为主）
+每日财经科技要闻（国内为主，覆盖最近 24 小时）
 - 金融：财联社 / 东方财富 / 华尔街见闻 / 新浪 7x24 实时快讯（公开 JSON API，无需 key）
 - 科技：IT之家新闻列表（公开 JSON API，无需 key）
 交给 DeepSeek 整合成中文简报（分国内/国际两大板块，每条标注时间），
 通过 QQ 邮箱 SMTP 发送 HTML 邮件。供 GitHub Actions 每天定时调用。
+所有敏感信息从环境变量读取。
 """
 import os
 import re
@@ -29,7 +30,10 @@ TO_EMAIL = os.environ.get("TO_EMAIL", "")
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
-SYSTEM_PROMPT = """你是一名专业的财经科技新闻编辑。用户会给你两批中文新闻，每条都带 [时间] 和来源。
+BJ = timezone(timedelta(hours=8))
+HOURS_WINDOW = 24  # 只保留最近 24 小时的新闻（覆盖"今天上午 + 昨天下午"）
+
+SYSTEM_PROMPT = """你是一名专业的财经科技新闻编辑。用户会给你两批中文新闻，每条都带 [时间] 和来源，覆盖最近 24 小时。
 
 请整合成一份中文《每日财经科技要闻》简报，要求如下：
 
@@ -81,30 +85,41 @@ def clean_html(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
+def now_ts():
+    return int(datetime.now(timezone.utc).timestamp())
+
+
+def within_window(ts):
+    """时间戳是否在最近 HOURS_WINDOW 小时内；无法解析的保留。"""
+    if ts is None:
+        return True
+    return (now_ts() - ts) <= HOURS_WINDOW * 3600
+
+
 def fmt_ts(ts):
     """unix 秒 -> 'MM-DD HH:MM'（北京时间）"""
     try:
-        dt = datetime.fromtimestamp(int(ts), timezone(timedelta(hours=8)))
-        return dt.strftime("%m-%d %H:%M")
+        return datetime.fromtimestamp(int(ts), BJ).strftime("%m-%d %H:%M")
     except Exception:
         return ""
 
 
-def fmt_time_str(s):
-    """'2026-10-04 10:55:14' 或 ISO -> 'MM-DD HH:MM'"""
+def bj_str_to_ts(s):
+    """'2026-10-04 10:55:14' 或 ISO（北京时间）-> unix 秒"""
     try:
         s2 = (s or "").replace("T", " ").split(".")[0].strip()
         if len(s2) >= 16:
-            dt = datetime.strptime(s2[:16], "%Y-%m-%d %H:%M")
-            return dt.strftime("%m-%d %H:%M")
+            dt = datetime.strptime(s2[:16], "%Y-%m-%d %H:%M").replace(tzinfo=BJ)
+            return int(dt.timestamp())
     except Exception:
         pass
-    return ""
+    return None
 
 
 # ---------- 国内金融快讯 ----------
 
 def fetch_cls():
+    """财联社电报（最新约 20 条，覆盖最近 1-2 小时）"""
     url = "https://www.cls.cn/api/cache?app=CailianpressWeb&name=telegraph&os=web&sv=8.7.9"
     data = http_get_json(url, {"Referer": "https://www.cls.cn/telegraph"})
     d = data.get("data", {}) or {}
@@ -115,27 +130,40 @@ def fetch_cls():
         brief = clean_html(it.get("brief") or it.get("content") or "")
         if not title and not brief:
             continue
-        out.append((title or brief[:40], brief[:200], fmt_ts(it.get("ctime"))))
+        ts = it.get("ctime")
+        try:
+            ts = int(ts)
+        except Exception:
+            ts = None
+        if not within_window(ts):
+            continue
+        out.append((title or brief[:40], brief[:200], fmt_ts(ts)))
     return out
 
 
 def fetch_eastmoney():
+    """东方财富快讯（page_size=200，可覆盖 2 天以上）"""
     trace = str(uuid.uuid4())
     url = ("https://np-listapi.eastmoney.com/comm/web/getNewsByColumns"
            f"?client=web&biz=web_home_channel&column=350,35,466,467&order=1"
-           f"&needInteractData=0&page_index=1&page_size=50&req_trace={trace}")
+           f"&needInteractData=0&page_index=1&page_size=200&req_trace={trace}")
     data = http_get_json(url)
     out = []
     for it in (data.get("data", {}) or {}).get("list", []):
         title = (it.get("title") or "").strip()
         summary = clean_html(it.get("summary") or "")
-        if title:
-            out.append((title, summary[:200], fmt_time_str(it.get("showTime"))))
+        if not title:
+            continue
+        ts = bj_str_to_ts(it.get("showTime"))
+        if not within_window(ts):
+            continue
+        out.append((title, summary[:200], fmt_ts(ts)))
     return out
 
 
 def fetch_wallstreet():
-    url = "https://api-one.wallstcn.com/apiv1/content/lives?channel=global-channel&limit=50"
+    """华尔街见闻实时快讯（limit=100，可覆盖约 1.5 天）"""
+    url = "https://api-one.wallstcn.com/apiv1/content/lives?channel=global-channel&limit=200"
     data = http_get_json(url, {
         "Referer": "https://wallstreetcn.com/",
         "Origin": "https://wallstreetcn.com",
@@ -143,27 +171,41 @@ def fetch_wallstreet():
     out = []
     for it in (data.get("data", {}) or {}).get("items", []):
         text = clean_html(it.get("content_text") or "")
-        if text:
-            out.append((text[:40], text[:200], fmt_ts(it.get("display_time"))))
+        if not text:
+            continue
+        ts = it.get("display_time")
+        try:
+            ts = int(ts)
+        except Exception:
+            ts = None
+        if not within_window(ts):
+            continue
+        out.append((text[:40], text[:200], fmt_ts(ts)))
     return out
 
 
 def fetch_sina():
+    """新浪 7x24 全球快讯（page_size=100）"""
     url = ("https://zhibo.sina.com.cn/api/zhibo/feed"
-           "?page=1&page_size=50&zhibo_id=152&tag_id=0&type=0")
+           "?page=1&page_size=100&zhibo_id=152&tag_id=0&type=0")
     data = http_get_json(url, {"Referer": "https://finance.sina.com.cn/7x24/"})
     feed = (((data.get("result", {}) or {}).get("data", {}) or {}).get("feed", {}) or {})
     out = []
     for it in feed.get("list", []):
         text = clean_html(it.get("rich_text") or "")
-        if text:
-            out.append((text[:40], text[:200], fmt_time_str(it.get("create_time"))))
+        if not text:
+            continue
+        ts = bj_str_to_ts(it.get("create_time"))
+        if not within_window(ts):
+            continue
+        out.append((text[:40], text[:200], fmt_ts(ts)))
     return out
 
 
 # ---------- 国内科技新闻 ----------
 
 def fetch_ithome():
+    """IT之家新闻（最近约 25 条，覆盖最近 2 小时）"""
     url = "https://api.ithome.com/json/newslist/news?page=1"
     data = http_get_json(url)
     out = []
@@ -174,7 +216,10 @@ def fetch_ithome():
         desc = clean_html(it.get("description") or "")
         if not title:
             continue
-        out.append((title, desc[:200], fmt_time_str(it.get("postdate"))))
+        ts = bj_str_to_ts(it.get("postdate"))
+        if not within_window(ts):
+            continue
+        out.append((title, desc[:200], fmt_ts(ts)))
     return out
 
 
@@ -197,7 +242,7 @@ def collect(source_list, limit):
             items = fn()[:limit]
             for title, desc, t in items:
                 collected.append((source, title, desc, t))
-            log(f"{source}: {len(items)} 条")
+            log(f"{source}: {len(items)} 条（24h内）")
         except Exception as e:
             log(f"{source}: 抓取失败 - {e}")
     return collected
@@ -245,9 +290,9 @@ def main():
         log("缺少必要环境变量：DEEPSEEK_API_KEY / SMTP_USER / SMTP_PASS / TO_EMAIL")
         raise SystemExit(1)
 
-    log("抓取国内金融快讯...")
-    finance = collect(CN_FINANCE, 25)
-    log("抓取国内科技新闻...")
+    log("抓取国内金融快讯（最近 24h）...")
+    finance = collect(CN_FINANCE, 60)
+    log("抓取国内科技新闻（最近 24h）...")
     tech = collect(CN_TECH, 25)
 
     if not finance and not tech:
