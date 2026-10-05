@@ -3,7 +3,7 @@ name: Daily News Digest
 on:
   schedule:
     # UTC 04:00 = 北京时间 12:00（中午）
-    - cron: '0 4 * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch: {}   # 允许在 GitHub 网页上手动点「Run workflow」测试
 
 jobs:
