@@ -12,6 +12,7 @@ import os
 import re
 import json
 import ssl
+import time
 import uuid
 import smtplib
 import urllib.request
@@ -68,6 +69,18 @@ SYSTEM_PROMPT = """你是一名专业的财经科技新闻编辑。用户会给�
 
 def log(msg):
     print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def retry(fn, tries=3, delay=10, desc=""):
+    """失败自动重试，用于 DeepSeek / SMTP 等瞬时故障，避免漏发整天。"""
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            if i == tries - 1:
+                raise
+            log(f"{desc} 第 {i+1} 次失败，{delay}s 后重试：{e}")
+            time.sleep(delay)
 
 
 def http_get_json(url, headers=None):
@@ -311,7 +324,7 @@ def main():
     news_text = "\n".join(lines)
 
     log("调用 DeepSeek 整合...")
-    digest = call_deepseek(news_text)
+    digest = retry(lambda: call_deepseek(news_text), desc="DeepSeek 整合")
     digest = re.sub(r"^```(?:html)?\s*", "", digest.strip())
     digest = re.sub(r"\s*```$", "", digest)
 
@@ -327,7 +340,7 @@ def main():
     )
 
     log("发送邮件...")
-    send_email(html)
+    retry(lambda: send_email(html), desc="发送邮件")
     log(f"已发送到 {TO_EMAIL}")
 
 
